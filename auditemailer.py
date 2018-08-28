@@ -1,6 +1,9 @@
 
 from abc import ABC, abstractmethod
 from utilities import send_mail_via_com
+from getpass import getuser
+from shutil import copyfile
+from warnings import warn
 
 class AuditEmailer(ABC):
 	"""Abstract class for creating and sending emails based on audit report of a project workflow
@@ -46,11 +49,10 @@ class AuditEmailer(ABC):
 	def __call__(self, run_date, autosend):
 		"""Main caller for creating and sending emails
 		"""
-		study_df=read_csv(r"{0}\Audit_Report_{1}.csv".format(self.audit_report_path,run_date), dtype=str)
+		study_df=read_csv(self.copy_report(run_date), dtype=str)
 		study_df=study_df.applymap(lambda x: "" if x.lower()=="nan" else x)
 		study_df=study_df.apply(patch, axis=1)
 		self.send(study_df, run_date, autosend)
-
 
 	def send(self, study_df, run_date, autosend=False):
 		"""Create, save, and send emails for this project
@@ -66,7 +68,7 @@ class AuditEmailer(ABC):
 		specific_df=study_df.loc[study_df["date"] != "_ALL_",:]
 		general_df=study_df.loc[study_df["date"] == "_ALL_",:]
 		for k,v in study_groups:
-			if type(k)==str:
+			if self.inv_prefix is None:
 				study=k
 				inv=None
 				subset_func=lambda x: x[self.study_prefix]==study
@@ -78,15 +80,15 @@ class AuditEmailer(ABC):
 			general_df=general_df.loc[general_df.apply(subset_func, axis=1),:]
 			analyst_name=general_df.loc[0,"fullname"]
 			analyst_email=general_df.loc[0,"email"]
-			full_study_name=self._full_study_name(study, inv)
-			name, email, body=construct_email(analyst_name, analyst_email,
+			full_study_name=self.full_study_name(study, inv)
+			name, email, body=self.construct_email(analyst_name, analyst_email,
 												full_study_name, specific_df, general_df)
 			if body != "":
 				send_mail_via_com(body=html_body, 
 								subject="[ACTION REQUIRED] - {0}".format(full_study_name), 
 								recipient=analyst_email, 
 								on_behalf_of=self.sender,
-								save_path=self.define_outpath(run_date),
+								save_path=r"{0}\{1}.msg".format(self.define_outpath(run_date),name),
 								autosend=autosend                      
 								)
 
@@ -97,8 +99,36 @@ class AuditEmailer(ABC):
 			os.mkdir(outpath)
 		return outpath
 
+	def copy_report(self, run_date, copy_from_downloads=False):
+		"""Copy the report for the correpsonding run_date from the users downloads folder to output location
+		Create output location if it does no exist
+		If copy_from_downloads, override everything and copy the file from downloads any way
+		"""
+		outpath=r"{0}\{1}".format(self.output_path, run_date)
+		outfullpath=r"{0}\Audit_Report_Output_{1}.csv".format(out_path, run_date)
+		path_exists=os.path.exists(out_path)
+		file_exists=os.path.isfile(outfullpath)
+		if not file_exists or copy_from_downloads:
+			if not path_exists:
+				os.mkdir(out_path)
+			try:
+				copyfile(r"C:\Users\{0}\Downloads\Audit_Report_Output_{1}.csv".format(getuser(),run_date),
+					outfullpath)
+			except FileNotFoundError:
+				if not file_exists:
+					raise FileNotFoundError("The Audit Report CSV file does not exist. Please make sure the file has been downloaded.")
+				else:
+					warn("The Audit Report CSV file does not exist in the downloads folder. File not copied.")
 
-	def construct_email(analyst_name, analyst_email, study, inv, specific_df, general_df):
+		return outfullpath
+
+	def full_study_name(study, inv):
+		"""Return a string containing full name with prefixes for the given study/inv combo"""
+		full_name=" ".join([self.study_prefix.title(), study])
+		if self.inv_prefix is not None:
+			full_name=" ".join([full_name, self.inv_prefix.title(), inv])
+
+	def construct_email(self, analyst_name, analyst_email, study, inv, specific_df, general_df):
 		"""Returns tuple of analyst_name, analyst_email, html_body where HTML body is the full email body for the given study/investigation
 
 		Parameters:
@@ -109,13 +139,13 @@ class AuditEmailer(ABC):
 		specific_df - Dataframe containing variables indicating what errors were made spefically for each study/inv, deliverable date combination
 		general_df - Dataframe contatining variables indicating what errors were made spefically for each study/inv overall. Dataframe is assumed to be one row.
 		"""
-		full_study_name=_full_study_name(study, inv)
+		full_study_name=self.full_study_name(study, inv)
 		deliver_errors=[s for s in overall_df.loc[0, "deliver_error"].split("#\n") if s != ""]
 		data_errors=[s for s in overall_df.loc[0, "data_error"].split("#\n") if s != ""]
 		log_errors=[s for s in overall_df.loc[0, "log_error"].split("#\n") if s != ""]
-		general_error=general_error_body(deliver_error_body(deliver_errors),
-											data_error_body(data_errors),
-											logs_error_body(log_errors))
+		general_error=self.general_error_body(self.deliver_error_body(deliver_errors), 
+											self.data_error_body(data_errors),
+											self.logs_error_body(log_errors))
 		specific_errors=""
 		for r in range(0, specific_df.shape[0]):
 			deliverable="%s - %s" % (specific_df.date.iloc[r], specific_df.deliver_type.iloc[r].title())
@@ -123,14 +153,15 @@ class AuditEmailer(ABC):
 			deliver_errors=[d for d in specific_df.loc[r, "deliver_error"].split("#\n") if d != ""]
 			data_errors=[d for d in specific_df.loc[r, "data_error"].split("#\n") if d != ""]
 			log_errors=[d for d in specific_df.loc[r, "log_error"].split("#\n") if d != ""]
-			specific_errors+=specific_error_list(deliverable,
-												svn_error_body(svn_errors),
-												deliver_error_body(deliver_errors),
-												data_error_body(data_errors),
-												logs_error_body(log_errors))
-		specific_error=specific_error_body(specific_errors)
-		return (analyst_name.replace(" ", "_"), analyst_email, email_body(analyst_name, full_study_name, general_error, specific_error))
+			specific_errors+=self.specific_error_list(deliverable,
+												self.svn_error_body(svn_errors),
+												self.deliver_error_body(deliver_errors),
+												self.data_error_body(data_errors),
+												self.logs_error_body(log_errors))
+		specific_error=self.specific_error_body(specific_errors)
+		return (analyst_name.replace(" ", "_"), analyst_email, self.email_body(analyst_name, full_study_name, general_error, specific_error))
 
+	@staticmethod
 	def email_body(analyst_name, full_study_name, general_error_body, specific_error_body):
 		"""Return the entire HTML body of the email"""
 		if general_error_body != "" or specific_error_body != "":
@@ -157,6 +188,7 @@ class AuditEmailer(ABC):
 		else:
 			return ""
 
+	@staticmethod
 	def general_error_body(general_deliver_error, general_data_error, general_logs_error):
 		"""Return the HTML snippet containing the errors general to the study/inv"""
 		if any([item != "" for item in [general_deliver_error, general_data_error, general_logs_error]]):
@@ -173,6 +205,7 @@ class AuditEmailer(ABC):
 		else:
 		return ""
 
+	@staticmethod
 	def specific_error_body(deliverables_errors):
 		"""Return the HTML snippet conatining the errors specific to all deliverables"""
 		if deliverables_errors != "":
@@ -185,9 +218,10 @@ class AuditEmailer(ABC):
 			</p>
 			""".format(deliverables_errors)
 			else:
-			return ""
+		return ""
 
-		def specific_error_list(deliverable, svn_error, deliver_error, data_error, logs_error):
+	@staticmethod
+	def specific_error_list(deliverable, svn_error, deliver_error, data_error, logs_error):
 		"""Return the HTML snippet containing the list item conatining specific errors related to the deliverable data"""
 		if any([item !="" for item in [svn_error, deliver_error, data_error, logs_error]]):
 			return """\
@@ -199,45 +233,43 @@ class AuditEmailer(ABC):
 					{4}               
 				</ul>
 			""".format(deliverable, svn_error, deliver_error, data_error, logs_error)
-			else:
-		return ""
+		else:
+			return ""
 
 	def deliver_error_body(errors):
 		"""Return the HTML snippet for errors in deliverables"""
-	    return _prefix_error_body("Deliverables:", errors)
+	    return self._prefix_error_body("Deliverables:", errors)
 
 	def data_error_body(errors):
 		"""Return the HTML snippet for errors in output data"""
-	    return _prefix_error_body("Data:", errors)
+	    return self._prefix_error_body("Data:", errors)
 
 	def logs_error_body(errors):
 		"""Return the HTML snippet for errors in logs"""
-	    return _prefix_error_body("Logs:", errors)
+	    return self._prefix_error_body("Logs:", errors)
 
 	def svn_error_body(errors):
 		"""Return the HTML snippet for errors in the svn commit message"""
-	    return _prefix_error_body("SVN:", errors)    
+	    return self._prefix_error_body("SVN:", errors)    
 
+    @staticmethod
 	def _prefix_error_body(prefix, errors):
 		"""Return a string of HTML code containing a list item of an unorder list of elements of errors"""
-		error_string=""
+		error_list=""
 		if len(errors)>0:
 			if len(errors)>1:
 				error_body=["<ul>"] + ["<li>%s</li>" % e for e in errors] + ["</ul>"]
 			error_string="<li>{0} {1}</li>".format(prefix, "".join(error_body))
 		return error_list
 
-	def _full_study_name(study, inv):
-		"""Return a string containing full name with prefixes for the given study/inv combo"""
-		full_name=" ".join([self.study_prefix.title(), study])
-		if self.inv_prefix is not None:
-			full_name=" ".join([full_name, self.inv_prefix.title(), inv])
-
-	def _patch(row):
+	@staticmethod
+	def patch(row):
 		"""Return a Series object representing a row in the study df dataframe
 		Based on study, inv, and date, keep errors intact or remove errors
 		row is assumed to be a row from the audit report dataframe
 		"""
 		return row
+
+
 
 		
